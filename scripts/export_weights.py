@@ -237,15 +237,36 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
     rms_norm_eps = float(cfg["rms_norm_eps"])
     rope_theta = float(cfg["rope_theta"])
     tie_emb = bool(cfg.get("tie_word_embeddings", True))
+    # The runtime reuses embed_tokens as lm_head; an untied lm_head (Qwen3-4B+) would be dropped.
+    if not tie_emb:
+        raise SystemExit("Unsupported model: tie_word_embeddings=false (use Qwen3-0.6B or Qwen3-1.7B)")
 
-    st_path = os.path.join(model_dir, "model.safetensors")
+    # Single file, or shards listed in model.safetensors.index.json (Qwen3-1.7B and up)
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            shard_names = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shard_names = ["model.safetensors"]
+    tensor_src = {}  # tensor name -> (open file, header, data_offset)
+    for shard in shard_names:
+        st_path = os.path.join(model_dir, shard)
+        hdr, data_offset = load_safetensors_header(st_path)
+        sf = open(st_path, "rb")
+        for name in hdr:
+            if name != "__metadata__":
+                tensor_src[name] = (sf, hdr, data_offset)
+
+    def read(name):
+        f, h, off = tensor_src[name]
+        return read_tensor_f32(f, h, off, name)
+
     tok_path = os.path.join(model_dir, "tokenizer.json")
-    hdr, data_offset = load_safetensors_header(st_path)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     tok_blob = build_tokenizer_blob(tok_path, vocab_size)
 
-    with open(st_path, "rb") as sf, open(out_path, "wb") as out:
+    with open(out_path, "wb") as out:
         # Reserve header
         out.write(b"\x00" * HEADER_SIZE)
 
@@ -255,10 +276,10 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
 
         # 2. Embeddings (tied with lm_head)
         off_embed = pad64(out)
-        emb = read_tensor_f32(sf, hdr, data_offset, "model.embed_tokens.weight")
+        emb = read("model.embed_tokens.weight")
         assert emb.shape == (vocab_size, dim), f"Unexpected embed shape {emb.shape}"
-        if "lm_head.weight" in hdr and tie_emb:
-            lmh = read_tensor_f32(sf, hdr, data_offset, "lm_head.weight")
+        if "lm_head.weight" in tensor_src and tie_emb:
+            lmh = read("lm_head.weight")
             max_diff = float(np.max(np.abs(emb - lmh)))
             assert max_diff == 0.0, f"tie_word_embeddings=True but diff={max_diff}"
             print("Verified embed_tokens == lm_head exact (max_diff=0.0)")
@@ -275,10 +296,10 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
             prefix = f"model.layers.{l}"
 
             # 4 FP32 norm vectors
-            in_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.input_layernorm.weight")
-            q_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.self_attn.q_norm.weight")
-            k_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.self_attn.k_norm.weight")
-            post_norm = read_tensor_f32(sf, hdr, data_offset, f"{prefix}.post_attention_layernorm.weight")
+            in_norm = read(f"{prefix}.input_layernorm.weight")
+            q_norm = read(f"{prefix}.self_attn.q_norm.weight")
+            k_norm = read(f"{prefix}.self_attn.k_norm.weight")
+            post_norm = read(f"{prefix}.post_attention_layernorm.weight")
 
             assert in_norm.shape == (dim,)
             assert q_norm.shape == (head_dim,)
@@ -302,7 +323,7 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
             ]
             for name, expected_shape in proj_specs:
                 pad64(out)
-                mat = read_tensor_f32(sf, hdr, data_offset, name)
+                mat = read(name)
                 assert mat.shape == expected_shape, f"{name}: got {mat.shape}, expected {expected_shape}"
                 out.write(quantize_matrix_q8_0_row_split(mat, scale_dtype=scale_dtype))
 
@@ -318,7 +339,7 @@ def export_model(model_dir: str, out_path: str, max_seq_len: int = 4096, scale_d
 
         # 4. Final RMSNorm
         off_final_norm = pad64(out)
-        final_norm = read_tensor_f32(sf, hdr, data_offset, "model.norm.weight")
+        final_norm = read("model.norm.weight")
         assert final_norm.shape == (dim,)
         out.write(final_norm.astype("<f4").tobytes())
         file_size = pad64(out)
