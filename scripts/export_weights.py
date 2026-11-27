@@ -77,9 +77,10 @@ def read_tensor_f32(f, hdr, data_offset: int, name: str) -> np.ndarray:
     f.seek(data_offset + start)
     raw = f.read(end - start)
     if dtype == "BF16":
-        u16 = np.frombuffer(raw, dtype=np.uint16)
-        f32 = (u16.astype(np.uint32) << 16).view(np.float32)
-        return f32.reshape(shape)
+        u32 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+        del raw
+        u32 <<= 16  # in place: no second full-size temporary
+        return u32.view(np.float32).reshape(shape)
     elif dtype == "F32":
         return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
     elif dtype == "F16":
@@ -88,9 +89,19 @@ def read_tensor_f32(f, hdr, data_offset: int, name: str) -> np.ndarray:
         raise ValueError(f"Unsupported dtype {dtype} for tensor {name}")
 
 
-def quantize_matrix_q8_0_row_split(w: np.ndarray, scale_dtype: str = "fp16") -> bytes:
-    """Quantize [M, K] float32 matrix into per-row split Q8_0 bytes."""
+def quantize_matrix_q8_0_row_split(w: np.ndarray, scale_dtype: str = "fp16", chunk_rows: int = 4096) -> bytes:
+    """Quantize [M, K] float32 matrix into per-row split Q8_0 bytes.
+
+    Rows are independent, so work in row chunks: numpy temporaries on the whole
+    embedding of Qwen3-1.7B (151936 x 2048) need several GB of RAM.
+    """
     assert w.ndim == 2
+    return b"".join(
+        _quantize_rows_q8_0(w[i:i + chunk_rows], scale_dtype) for i in range(0, w.shape[0], chunk_rows)
+    )
+
+
+def _quantize_rows_q8_0(w: np.ndarray, scale_dtype: str) -> bytes:
     M, K = w.shape
     assert K % 32 == 0, f"K={K} must be a multiple of 32"
     nb = K // 32
