@@ -1,0 +1,7 @@
+.git
+build
+models
+data
+checkpoints
+runs
+.venv
